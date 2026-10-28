@@ -1,0 +1,628 @@
+local Signal = require("@src/utility/signal");
+local Keybinds = base_require(game:GetService("ReplicatedStorage"):WaitForChild("KeyBinds"));
+
+-- restore: live KeyHandler lookup (see action_tracker.lua — stale snapshots)
+local function live_kh()
+    local gg = (typeof(getgenv) == "function" and getgenv()) or _G
+    local kh = gg and gg.KeyHandler or nil
+    if type(kh) == "table" then return kh end
+    return KeyHandler
+end
+
+-- restore: bundle Auto Defense execution gaps (QueuedBlocking 25926-26150,
+-- valid() 77593-77702, StartBlock 75267-75269)
+local unblock_jitter = Random.new()
+local function live_er()
+    local gg = (typeof(getgenv) == "function" and getgenv()) or _G
+    local er = gg and gg.EffectReplicator or nil
+    if type(er) == "table" then return er end
+    return EffectReplicator
+end
+-- bundle UseIFrames (75553-75587): never parry/dodge while i-frames are up
+local IFRAME_EFFECTS = { "Immortal", "DodgeFrame", "ParryFrame", "Ghost" }
+local function has_iframes()
+    local er = live_er()
+    if not er then return false end
+    for _, name in IFRAME_EFFECTS do
+        local ok, has = pcall(function() return er:HasEffect(name) end)
+        if ok and has then return true end
+    end
+    return false
+end
+
+local DefendActionManager = {} do
+    DefendActionManager.actions_to_play_through = {};
+    DefendActionManager.currently_handling = {};
+    DefendActionManager.on_update = Signal.new();
+    DefendActionManager.block = {}
+    DefendActionManager.unblock = {}
+
+    local sent_actions = 0;
+    function DefendActionManager.block:FireServer()
+        sent_actions += 1;
+        task.delay(1, function()
+            sent_actions -= 1;
+        end);
+
+        if sent_actions >= 75 then
+            return        
+end
+
+        local remote = live_kh():get_cache("Block");
+
+        if remote and not remote:IsDescendantOf(local_player.character) then
+            remote = nil
+        end
+        
+        if not remote then
+            remote = live_kh():get_key("Block")
+        end
+        
+        if not remote then return end 
+        remote:FireServer()
+    end
+
+    function DefendActionManager.unblock:FireServer()
+        sent_actions += 1;
+        task.delay(1, function()
+            sent_actions -= 1;
+        end);
+
+        if sent_actions >= 75 then
+            return        
+end
+
+        local remote = live_kh():get_cache("Unblock");
+
+        if remote and not remote:IsDescendantOf(local_player.character) then
+            remote = nil
+        end
+        
+        if not remote then
+            remote = live_kh():get_key("Unblock")
+        end
+        
+        if not remote then return end 
+        remote:FireServer()
+    end
+
+    function DefendActionManager:add_action(mob, action_type, when, seq_tag_or_other)
+        self._action_seq_counter = (self._action_seq_counter or 0) + 1
+        getgenv().RAIN_LASTQ = { type = action_type, t = tick() };
+        -- restore: passive on-screen telemetry (no console needed).
+        -- "[AP] queued block" = decision reached the queue.
+        if action_type == "block" then
+            getgenv().__rain_nq = getgenv().__rain_nq or 0
+            if tick() - getgenv().__rain_nq > 3 then
+                getgenv().__rain_nq = tick()
+                pcall(function() setthreadidentity(8) Logger:short_notify("[AP] queued block") end)
+            end
+        end
+
+        table.insert(self.actions_to_play_through, {
+            mob = mob,
+            type = action_type,
+            when = when,
+            seq = seq_tag_or_other,  
+            other = seq_tag_or_other, 
+            _action_id = self._action_seq_counter,
+        });
+
+        self.on_update:fire();
+    end;
+
+    function DefendActionManager:wrap_add_action(type)
+        return function(_, mob, delay)
+            self:add_action(mob, type, tick() + delay);
+        end    
+end;
+
+    DefendActionManager.queue_block_task = DefendActionManager:wrap_add_action("block");
+    DefendActionManager.queue_unblock_task = function(self, mob, delay, seq)
+        
+        if seq then
+            for i = #self.actions_to_play_through, 1, -1 do
+                local v = self.actions_to_play_through[i]
+                if v.type == "unblock" and (v.seq == seq or v.other == seq) then
+                    
+                    local new_when = tick() + delay;
+                    if new_when > v.when then
+                        v.when = new_when;
+                    end
+                    return                
+end
+            end;
+        end
+
+        self:add_action(mob, "unblock", tick() + delay, seq);
+    end;
+
+    local random = Random.new();
+    -- restore: bundle unblock hold jitter 0.075-0.115s (QueuedBlocking 25959-25961)
+    function DefendActionManager:queue_generic_parry_task_no_convert(mob)
+        self._current_parry_seq = (self._current_parry_seq or 0) + 1
+        local seq = self._current_parry_seq
+        getgenv().__rain_lastblockq = tick()
+
+        self:add_action(mob, "block", tick(), seq);
+        self:add_action(mob, "unblock", tick() + 0.1 + unblock_jitter:NextNumber(0.075, 0.115), seq);
+    end;
+    
+    function DefendActionManager:queue_generic_parry_task(mob, t)
+        self._current_parry_seq = (self._current_parry_seq or 0) + 1
+        local seq = self._current_parry_seq
+        getgenv().__rain_lastblockq = tick()
+
+        self:add_action(mob, "block", tick(), seq);
+        self:add_action(mob, "unblock", tick() + (t or 0.1) + unblock_jitter:NextNumber(0.075, 0.115), seq);
+    end;
+
+    function DefendActionManager:queue_generic_dodge_task(mob, delay)
+        self:add_action(mob, "dodge", tick() + (delay or 0));
+    end;
+
+    
+    local fallback_manager = require("@src/features/auto-parry/fallbacks/manager");
+
+    local chance_fail_action_order = { "Parry", "Dodge", "Skip" }
+    local chance_fail_action_lookup = {
+        ["Parry"] = true,
+        ["Dodge"] = true,
+        ["Skip"] = true,
+    }
+
+    function DefendActionManager:normalize_chance_fail_weights(actions_or_weights)
+        local weights = {}
+
+        if typeof(actions_or_weights) == "string" then
+            if chance_fail_action_lookup[actions_or_weights] then
+                weights[actions_or_weights] = 100
+            end
+        elseif typeof(actions_or_weights) == "table" then
+            if #actions_or_weights > 0 then
+                for _, action in ipairs(actions_or_weights) do
+                    if chance_fail_action_lookup[action] then
+                        weights[action] = (weights[action] or 0) + 1
+                    end
+                end
+            else
+                for action, amount in pairs(actions_or_weights) do
+                    if not chance_fail_action_lookup[action] then
+                        continue
+                    end
+
+                    if typeof(amount) == "number" then
+                        weights[action] = math.max(0, amount)
+                    elseif amount then
+                        weights[action] = 1
+                    end
+                end
+            end
+        end
+
+        local total = 0
+        for _, action in ipairs(chance_fail_action_order) do
+            total += weights[action] or 0
+        end
+
+        if total <= 0 then
+            weights = { Skip = 100 }
+        end
+
+        return weights
+    end
+
+    function DefendActionManager:roll_chance_fail_action(weights)
+        local total = 0
+        for _, action in ipairs(chance_fail_action_order) do
+            total += weights[action] or 0
+        end
+
+        if total <= 0 then
+            return "Skip"
+        end
+
+        local rolled = math.random() * total
+        local running = 0
+
+        for _, action in ipairs(chance_fail_action_order) do
+            local amount = weights[action] or 0
+            if amount > 0 then
+                running += amount
+                if rolled <= running then
+                    return action
+                end
+            end
+        end
+
+        return "Skip"
+    end
+
+    function DefendActionManager:execute_failed_parry_variation(mob, actions_or_weights)
+        local weights = self:normalize_chance_fail_weights(actions_or_weights)
+        local chosen = self:roll_chance_fail_action(weights)
+
+        return chosen or "Skip"
+    end
+
+    LPH_NO_VIRTUALIZE(function()
+        function DefendActionManager:defend_action_block(action, dont_pass)
+            -- restore: bundle gates — i-frames (75553-75587), Action/Knocked (26048-26050)
+            if has_iframes() then return end
+                    do
+                local er = live_er()
+                local ok_a, act = pcall(function() return er:HasEffect("Action") end)
+                local ok_k, kn = pcall(function() return er:HasEffect("Knocked") end)
+                if (ok_a and act) or (ok_k and kn) then return end
+            end
+        
+            if aztup.flags.ap_randomization then
+                if math.random() < aztup.flags.parry_to_fallback_chance / 100 then
+                    if fallback_manager:execute() then
+                        return                    
+end;
+                end
+            end
+        
+            if not dont_pass then
+                if not local_player.tracker:can_parry() then
+                    local should_return = false;
+                
+                    if local_player.tracker:can_dodge() then
+                        should_return = true;
+                        return self:defend_action_dodge(action)                    
+else
+                        if fallback_manager:execute() then
+                            should_return = true;
+                        end;
+                    end
+                
+                    if should_return or not aztup_options.fallbacks.Value.Block then  
+                        local seq = action.seq
+                        if seq then
+                            for j = #self.actions_to_play_through, 1, -1 do
+                                local other = self.actions_to_play_through[j]
+                                if other.type == "unblock" and other.other == seq then
+                                    table.remove(self.actions_to_play_through, j)
+                                end;
+                            end;
+                        end
+                        return                    
+elseif aztup_options.fallbacks.Value.Block then
+                        if aztup.flags.auto_parry_debug then
+                            setthreadidentity(8);
+                            Logger:short_notify("[AP] Forced to block fallback.")
+                        end
+                    end;
+                end;
+            end
+        
+            if getgenv().block_call then 
+                getgenv().block_call(true)
+            end;
+        
+            -- restore: "[AP] BLOCK FIRED" = remote actually sent.
+            getgenv().__rain_nf = getgenv().__rain_nf or 0
+            if tick() - getgenv().__rain_nf > 5 then
+                getgenv().__rain_nf = tick()
+                pcall(function() setthreadidentity(8) Logger:short_notify("[AP] BLOCK FIRED") end)
+            end
+            return self.block:FireServer()
+        end;
+    
+    
+        function DefendActionManager:defend_action_dodge(action)
+            -- restore: bundle UseIFrames (75585-75587)
+            if has_iframes() then return end
+            local type = action.mob.Name:sub(1, 1) == "." and "pve_" or "pvp_"
+            if aztup.flags[type .. "blatant_roll"] and not action.full then
+                -- restore: bundle InputClient.dodge (10828-10876). There is NO
+                -- "Dodge" remote in the KeyHandler table (bundle never requests
+                -- one) — the dodge remote lives in CharacterHandler.Requests.
+                -- The old get_key("Dodge") returned nil and errored here, so no
+                -- blatant dodge/roll-cancel ever ran.
+                do
+                    local char = local_player.character
+                    local ch = char and char:FindFirstChild("CharacterHandler")
+                    local req = ch and ch:FindFirstChild("Requests")
+                    local dodge_remote = req and req:FindFirstChild("Dodge")
+                    local er0 = getgenv().EffectReplicator or EffectReplicator
+                    local function has_fx(n)
+                        local ok, r = pcall(function() return er0:HasEffect(n) end)
+                        return ok and r
+                    end
+                    if dodge_remote then
+                        local hrp = char:FindFirstChild("HumanoidRootPart")
+                        local in_air = false
+                        if hrp then
+                            local ok_r, hit = pcall(function()
+                                return workspace:Raycast(hrp.Position, Vector3.new(0, -4, 0), RaycastParams.new())
+                            end)
+                            in_air = ok_r and hit == nil
+                        end
+                        dodge_remote:FireServer(has_fx("ClientSwim") and "waterdash" or "roll", {
+                            ancient = false,
+                            spin_attack = has_fx("SpinAttack") and true or false,
+                            in_air = in_air and true or false,
+                        })
+                    end
+                end
+            
+                if aztup.flags[type .. "blatant_roll_with_anims"] then
+                    task.spawn(function() 
+                        
+                        local l_Movement_0 = game:GetService("ReplicatedStorage").Assets.Anims.Movement;
+                        local l_ForwardRoll_0 = l_Movement_0.Roll.ForwardRoll;
+                        local l_BackRoll_0 = l_Movement_0.Roll.BackRoll;
+                        local l_RightRoll_0 = l_Movement_0.Roll.RightRoll;
+                        local l_LeftRoll_0 = l_Movement_0.Roll.LeftRoll;
+                        
+                        local l_LookVector_0 = local_player.root_part.CFrame.LookVector;
+                        local l_MoveDirection_1 = local_player.humanoid.MoveDirection;
+                        if l_MoveDirection_1.Magnitude < 0.1 then
+                            l_MoveDirection_1 = -l_LookVector_0;
+                        end;
+                        local v224;
+                        local v227 = math.deg((math.acos((math.clamp(l_MoveDirection_1:Dot(l_LookVector_0), -1, 1)))));
+                        local v228 = nil;
+                        if v227 <= 45 then
+                            v224 = l_ForwardRoll_0;
+                        elseif v227 > 45 and v227 < 135 then
+                            v228 = math.deg((math.acos((math.clamp(l_MoveDirection_1:Dot((Vector3.new(-l_LookVector_0.z, 0, l_LookVector_0.x))), -1, 1)))));
+                            v224 = if v228 <= 45 then l_RightRoll_0 else if v228 > 135 then l_LeftRoll_0 else l_BackRoll_0;
+                        else
+                            v224 = l_BackRoll_0;
+                        end;
+                        local l_ForwardWaterDash_0 = l_Movement_0.WaterDash.ForwardWaterDash;
+                        local l_BackWaterDash_0 = l_Movement_0.WaterDash.BackWaterDash;
+                        local l_RightWaterDash_0 = l_Movement_0.WaterDash.RightWaterDash;
+                        local l_LeftWaterDash_0 = l_Movement_0.WaterDash.LeftWaterDash;
+                        local v86 = {
+                            [l_ForwardRoll_0] = l_ForwardWaterDash_0, 
+                            [l_BackRoll_0] = l_BackWaterDash_0, 
+                            [l_RightRoll_0] = l_RightWaterDash_0, 
+                            [l_LeftRoll_0] = l_LeftWaterDash_0
+                        };
+                        
+                        local anim = EffectReplicator:FindEffect("ClientSwim") and v86[v224] or v224;
+                        
+                        local first_roll_track = local_player.humanoid:LoadAnimation(anim);
+                        first_roll_track:Play(0.1, 1, 1);
+                        task.wait()
+                        first_roll_track:Stop(0.1);
+                        
+                        local v68 = local_player.humanoid:LoadAnimation(l_Movement_0.Roll.CancelRight);
+                        v68:Play();
+                    end)
+                end
+            
+                return task.delay(.15, function()
+                    live_kh():get_key("StopDodge"):FireServer({
+                        W = false,
+                        Right = true,
+                        S = false,
+                        NOAERIALS = false
+                    }, EffectReplicator:HasEffect("LightAttack"))
+                end)            
+end;
+        
+            local roll_cancel = aztup.flags[type .. "roll_cancel"];
+        
+            if getgenv().requesting_dodge then 
+                getgenv().requesting_dodge()
+            end;
+        
+            Keybinds.ForceActionDown("Dodge")
+            Keybinds.ForceActionUp("Dodge")
+        
+            if roll_cancel and aztup.flags[type .. "roll_cancel_chance"] > (math.random() * 100) and not action.full then
+                task.wait(math.random(aztup.flags[type .. "min_roll_cancel_delay"], aztup.flags[type .. "max_roll_cancel_delay"] >= aztup.flags[type .. "min_roll_cancel_delay"] and aztup.flags[type .. "max_roll_cancel_delay"] or aztup.flags[type .. "min_roll_cancel_delay"]) / 1000)
+                
+                local client_feint = EffectReplicator:CreateEffect("ClientFeint");
+                
+                if client_feint then
+                    client_feint:Debris(0.1);
+                end;
+            end
+        
+            return        
+end;
+    
+    
+        function DefendActionManager:defend_action_unblock()
+            self.unblock:FireServer()
+            
+            if getgenv().block_call then 
+                task.delay(math.random(1, 5) / 100, function()
+                    getgenv().block_call(false)
+                end)
+            end;
+
+            task.spawn(function() 
+                local start = tick();
+                while (tick() - start <= 0.05 or EffectReplicator:FindEffect("Blocking")) and task.wait() do
+                    self.unblock:FireServer();
+                end
+            end)
+        end;
+    end)();
+
+    function DefendActionManager:update() 
+        LPH_NO_VIRTUALIZE(function()
+            self._block_count = self._block_count or 0
+            self._dodge_until = self._dodge_until or 0
+            self._block_started_at = self._block_started_at or 0
+
+            if #self.actions_to_play_through > 5 then
+                table.clear(self.actions_to_play_through);
+            end
+
+            if self._block_count > 0 then
+                local has_pending_unblock = false
+                for i = #self.actions_to_play_through, 1, -1 do
+                    if self.actions_to_play_through[i].type == "unblock" then
+                        has_pending_unblock = true
+                        break
+                    end
+                end
+
+                
+                if self._block_started_at == 0 then
+                    self._block_started_at = tick()
+                end
+
+                
+                if (not has_pending_unblock) and (tick() - self._block_started_at > 0.25) then
+                    self._block_count = 0
+                    self._block_started_at = 0
+                    self:defend_action_unblock()
+                end
+            else
+                self._block_started_at = 0
+
+                
+                
+                
+                
+                
+                if EffectReplicator:FindEffect("Blocking") and not self._stray_block_unblocking and not general:raw_is_holding_f() then
+                    self._stray_block_unblocking = true
+
+                    if getgenv().block_call then
+                        getgenv().block_call(false)
+                    end;
+
+                    task.spawn(function()
+                        while EffectReplicator:FindEffect("Blocking") and not general:raw_is_holding_f() and task.wait() do
+                            self.unblock:FireServer();
+                        end
+                        self._stray_block_unblocking = false
+                    end)
+                end
+            end
+
+            
+            
+            local to_process = {};
+            local to_remove = {};
+
+            for i = #self.actions_to_play_through, 1, -1 do 
+                local v = self.actions_to_play_through[i]
+
+                if tick() >= v.when and not self.currently_handling[v] then
+                    local mob = v.mob
+                    local allowed_targets = aztup_options.allowed_targets.Value;
+
+                    local filtered = false;
+                    if not mob then
+                        if not allowed_targets.Unknown and not allowed_targets.All then
+                            filtered = true;
+                        end;
+                    else
+                        if not allowed_targets.PVP and services.Players:GetPlayerFromCharacter(mob) and not allowed_targets.All then
+                            filtered = true;
+                        end;
+                    
+                        if not allowed_targets.PVE and mob.Name:sub(1,1) == "." and not allowed_targets.All then
+                            filtered = true;
+                        end;
+                    end;
+
+                    if filtered then
+                        
+                        if v.type == "block" and v.seq then
+                            for j = #self.actions_to_play_through, 1, -1 do
+                                local other = self.actions_to_play_through[j]
+                                if other.type == "unblock" and (other.seq == v.seq or other.other == v.seq) then
+                                    table.remove(self.actions_to_play_through, j)
+                                    if j < i then i = i - 1 end
+                                end
+                            end
+                        end
+                        table.remove(self.actions_to_play_through, i)
+                        continue
+                    end
+                
+                    local typ = v.type
+
+                    if typ == "dodge" and (self._block_count or 0) > 0 then
+                        table.remove(self.actions_to_play_through, i)
+                        continue
+                    end
+
+                    if typ == "block" and tick() < self._dodge_until then
+                        local delta = self._dodge_until - tick()
+                        v.when = self._dodge_until
+
+                        
+                        if v.seq then
+                            for j = #self.actions_to_play_through, 1, -1 do
+                                local other = self.actions_to_play_through[j]
+                                if other.type == "unblock" and (other.seq == v.seq or other.other == v.seq) then
+                                    other.when = other.when + delta;
+                                end
+                            end;
+                        end
+                        continue
+                    end
+
+                    self.currently_handling[v] = true
+                    table.remove(self.actions_to_play_through, i)
+
+                    task.spawn(function()
+                        if typ == "block" then
+                            self._block_count = math.max(0, (self._block_count or 0) + 1)
+                            if self._block_count == 1 then
+                                self._block_started_at = tick()
+                                self:defend_action_block(v, v.other)
+                            end
+                        elseif typ == "unblock" then    
+                            if (self._block_count or 0) > 0 then
+                                self._block_count = math.max(0, (self._block_count or 0) - 1)
+                                if self._block_count == 0 then
+                                    self._block_started_at = 0
+                                    self:defend_action_unblock(v)
+                                end
+                            end
+                        elseif typ == "dodge" then
+                            self._dodge_until = tick() + 0.1;
+                            self:defend_action_dodge(v)
+                        end
+
+                        self.currently_handling[v] = nil
+                    end)
+
+                    if typ == "block" or typ == "dodge" then
+                        break                    
+end;
+                end
+            end
+        end)();
+    end;
+
+    local last = tick();
+    LPH_NO_VIRTUALIZE(function()
+        
+        
+        
+        
+
+        
+        
+        
+
+        aztup.maid:give_task(services.RunService.Heartbeat:Connect(function()
+            if tick() - last < 1 / 30 then
+                return            
+end
+
+            if sent_actions >= 75 then
+                return            
+end
+            
+            DefendActionManager:update();
+        end));
+    end)();
+end;
+
+return DefendActionManager
